@@ -1,3 +1,4 @@
+import base64
 import unittest
 from typing import Optional
 
@@ -5,6 +6,7 @@ from webtest import TestApp
 
 from dtos import IndexResponse, HealthResponse, V1ResponseBase, STATUS_OK, STATUS_ERROR
 import flaresolverr
+import flaresolverr_service
 import utils
 
 
@@ -649,6 +651,24 @@ class TestFlareSolverr(unittest.TestCase):
 
         body = V1ResponseBase(res.json)
         self.assertEqual(STATUS_OK, body.status)
+
+
+class TestDownloadHelpers(unittest.TestCase):
+
+    def test_is_html_download_detects_html(self):
+        html_b64 = base64.b64encode(b'<!DOCTYPE html><html><body>blocked').decode()
+        self.assertTrue(flaresolverr_service._is_html_download(html_b64))
+
+    def test_is_html_download_allows_binary(self):
+        png_b64 = base64.b64encode(b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR').decode()
+        self.assertFalse(flaresolverr_service._is_html_download(png_b64))
+
+    def test_failed_download_entry(self):
+        entry = flaresolverr_service._failed_download_entry(
+            'https://example.com/cover.jpg', 'HTML content')
+        self.assertEqual(entry['data'], 'failed')
+        self.assertEqual(entry['filename'], 'cover.jpg')
+        self.assertEqual(entry['url'], 'https://example.com/cover.jpg')
 
 
 if __name__ == '__main__':

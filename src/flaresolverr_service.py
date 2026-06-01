@@ -1,10 +1,12 @@
+import base64
 import logging
+import os
 import platform
 import sys
 import time
 from datetime import timedelta
 from html import escape
-from urllib.parse import unquote, quote
+from urllib.parse import unquote, quote, urlsplit
 
 from func_timeout import FunctionTimedOut, func_timeout
 from selenium.common import TimeoutException
@@ -55,6 +57,82 @@ TURNSTILE_SELECTORS = [
 
 SHORT_TIMEOUT = 1
 SESSIONS_STORAGE = SessionsStorage()
+
+_BROWSER_FETCH_SCRIPT = """
+return fetch(arguments[0], {credentials: 'include'})
+    .then(async r => {
+        const blob = await r.blob();
+        const mimeType = blob.type || 'application/octet-stream';
+        return new Promise((resolve) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve({
+                ok: r.ok,
+                status: r.status,
+                data: reader.result ? reader.result.split(',')[1] : null,
+                mimeType: mimeType
+            });
+            reader.readAsDataURL(blob);
+        });
+    });
+"""
+
+
+def _is_html_download(data_b64: str) -> bool:
+    if not data_b64 or data_b64 == 'failed':
+        return False
+    try:
+        padding = '=' * (-len(data_b64) % 4)
+        raw = base64.b64decode(data_b64[:256] + padding)
+    except Exception:
+        return True
+    head = raw[:512].lstrip()
+    return head.startswith(b'<!DOCTYPE') or head.startswith(b'<html') or head.startswith(b'<HTML')
+
+
+def _failed_download_entry(url: str, reason: str) -> dict:
+    logging.warning("Download failed for %s: %s", url, reason)
+    filename = os.path.basename(urlsplit(url).path) or 'download'
+    return {
+        'url': url,
+        'filename': filename,
+        'mime': 'application/octet-stream',
+        'data': 'failed',
+    }
+
+
+def _download_url_via_browser(driver: WebDriver, url: str) -> dict:
+    try:
+        result = driver.execute_script(_BROWSER_FETCH_SCRIPT, url)
+    except Exception as e:
+        return _failed_download_entry(url, str(e))
+
+    if not result or not result.get('data'):
+        return _failed_download_entry(url, 'No data returned')
+    if not result.get('ok'):
+        return _failed_download_entry(url, f"HTTP {result.get('status')}")
+
+    data_b64 = result['data']
+    mime_type = result.get('mimeType') or 'application/octet-stream'
+
+    if _is_html_download(data_b64):
+        return _failed_download_entry(url, 'HTML content (block/challenge page)')
+    if 'text/html' in mime_type.lower():
+        path_lower = urlsplit(url).path.lower()
+        if not path_lower.endswith(('.html', '.htm')):
+            return _failed_download_entry(url, 'Content-Type text/html')
+
+    filename = os.path.basename(urlsplit(url).path) or 'download'
+    logging.info("File downloaded: %s (%s)", url, mime_type)
+    return {
+        'url': url,
+        'filename': filename,
+        'mime': mime_type,
+        'data': data_b64,
+    }
+
+
+def _download_assets(driver: WebDriver, urls: list[str]) -> list[dict]:
+    return [_download_url_via_browser(driver, url) for url in urls]
 
 
 def test_browser_installation():
@@ -155,8 +233,8 @@ def _cmd_request_get(req: V1RequestBase) -> V1ResponseBase:
         raise Exception("Cannot use 'postBody' when sending a GET request.")
     if req.returnRawHtml is not None:
         logging.warning("Request parameter 'returnRawHtml' was removed in FlareSolverr v2.")
-    if req.download is not None:
-        logging.warning("Request parameter 'download' was removed in FlareSolverr v2.")
+    if req.download and req.downloadUrls is not None and len(req.downloadUrls) == 0:
+        raise Exception("Request parameter 'downloadUrls' must contain at least one URL when provided.")
 
     challenge_res = _resolve_challenge(req, 'GET')
     res = V1ResponseBase({})
@@ -172,8 +250,8 @@ def _cmd_request_post(req: V1RequestBase) -> V1ResponseBase:
         raise Exception("Request parameter 'postData' is mandatory in 'request.post' command.")
     if req.returnRawHtml is not None:
         logging.warning("Request parameter 'returnRawHtml' was removed in FlareSolverr v2.")
-    if req.download is not None:
-        logging.warning("Request parameter 'download' was removed in FlareSolverr v2.")
+    if req.download and req.downloadUrls is not None and len(req.downloadUrls) == 0:
+        raise Exception("Request parameter 'downloadUrls' must contain at least one URL when provided.")
 
     challenge_res = _resolve_challenge(req, 'POST')
     res = V1ResponseBase({})
@@ -481,6 +559,30 @@ def _evil_logic(req: V1RequestBase, driver: WebDriver, method: str) -> Challenge
 
     if req.returnScreenshot:
         challenge_res.screenshot = driver.get_screenshot_as_base64()
+
+    if req.download:
+        if req.downloadUrls:
+            download_urls = req.downloadUrls
+        elif req.url:
+            download_urls = [req.url]
+        else:
+            raise Exception("Request parameter 'url' or 'downloadUrls' is required when 'download' is true.")
+
+        logging.info("Downloading %s asset(s)...", len(download_urls))
+        downloads = _download_assets(driver, download_urls)
+        challenge_res.download = downloads
+
+        failed_count = sum(1 for item in downloads if item.get('data') == 'failed')
+        success_count = len(downloads) - failed_count
+        if failed_count == 0:
+            res.message = f"Successfully downloaded {success_count} asset(s)!"
+        elif success_count == 0:
+            res.message = f"All {failed_count} asset download(s) failed."
+        else:
+            res.message = (
+                f"Downloaded {success_count} asset(s), {failed_count} failed "
+                f"(failed entries have data: \"failed\")."
+            )
 
     res.result = challenge_res
     return res
